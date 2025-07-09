@@ -1,0 +1,446 @@
+---
+title: "Household Power consumption - Time Series Analysis"
+output: html_notebook
+---
+
+```{r setup, warning=F, message=F,echo=F}
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(feasts)
+library(tsibbledata)
+library(lubridate)
+library(forecast)
+library(zoo)
+library(tseries)
+library(corrplot)
+```
+
+1.date: Date in format dd/mm/yyyy
+2.time: time in format hh:mm:ss
+3.global_active_power: household global minute-averaged active power (in kilowatt)
+4.global_reactive_power: household global minute-averaged reactive power (in kilowatt)
+5.voltage: minute-averaged voltage (in volt)
+6.global_intensity: household global minute-averaged current intensity (in ampere)
+7.sub_metering_1: energy sub-metering No. 1 (in watt-hour of active energy). It corresponds to the kitchen, containing mainly a dishwasher, an oven and a microwave (hot plates are not electric but gas powered).
+8.sub_metering_2: energy sub-metering No. 2 (in watt-hour of active energy). It corresponds to the laundry room, containing a washing-machine, a tumble-drier, a refrigerator and a light.
+9.sub_metering_3: energy sub-metering No. 3 (in watt-hour of active energy). It corresponds to an electric water-heater and an air-conditioner.
+
+```{r}
+
+power_data <- read.table("household_power_consumption.txt", sep = ';', header = TRUE, na.strings = "?") %>%
+  mutate(datetime = dmy_hms(paste(Date, Time))) %>%
+  select(datetime, Global_active_power, Global_reactive_power, Voltage, Global_intensity, Sub_metering_1, Sub_metering_2, Sub_metering_3) %>%
+  tsibble(index = datetime)
+
+head(power_data)
+
+```
+```{r}
+power_data_filled <- power_data %>%
+  mutate(across(where(is.numeric), na.interp))
+
+head(power_data_filled)
+```
+Interpolation was used to fill the empty gaps in data, as methods like back-filling would not suffice for the length of gaps where the data was missing. 
+
+```{r}
+ggplot(power_data_filled[0:60000, ], aes(x = datetime, y = Global_active_power)) +
+  geom_line() +
+  labs(
+    title = "Time Series plot of Global active power in the household", 
+    x = "Time", 
+    y = "Global active power"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+monthly_ga_power <- power_data_filled %>%
+  index_by(month = ~ yearmonth(.)) %>%
+  summarize(
+    average_ga_power = mean(Global_active_power, na.rm = TRUE),
+    total_ga_power = sum(Global_active_power, na.rm = TRUE)
+  )
+
+head(monthly_ga_power)
+```
+
+```{r}
+
+ggplot(monthly_ga_power, aes(x = month, y = average_ga_power)) +
+  geom_line() +
+  labs(
+    title = "Time Series plot of monthly average Global active power",
+    x = "Monthly Average",
+    y = "Month"
+  )
+
+```
+```{r}
+
+ggplot(monthly_ga_power, aes(x = month, y = total_ga_power)) +
+  geom_line() +
+  labs(
+    title = "Time Series plot of monthly total Global active power",
+    x = "Monthly Total",
+    y = "Month"
+  )
+
+```
+
+
+
+```{r}
+
+monthly_ga_power %>%
+  model(
+    classical_decomposition(average_ga_power, type = "multiplicative")
+  ) %>%
+  components() %>%
+  autoplot()
+
+```
+
+There is a seasonal element to the monthly average global active power for the household, with a peak in average usage during the months of Jan. 
+
+Analysing seasonal trends for the 3 submeter readings... 
+
+
+```{r}
+
+monthly_sm_power <- power_data_filled %>%
+  index_by(month = ~ yearmonth(.)) %>%
+  summarize(
+    sm1_avg = mean(Sub_metering_1, na.rm = TRUE),
+    sm1_total = sum(Sub_metering_1, na.rm = TRUE),
+    sm2_avg = mean(Sub_metering_2, na.rm = TRUE),
+    sm2_total = sum(Sub_metering_2, na.rm = TRUE),
+    sm3_avg = mean(Sub_metering_3, na.rm = TRUE),
+    sm3_total = sum(Sub_metering_3, na.rm = TRUE)
+  )
+
+head(monthly_sm_power)
+
+```
+
+```{r}
+ggplot(monthly_sm_power, aes(x = month, y = sm1_avg)) +
+  geom_line() +
+  labs(
+    title = "Time Series plot of monthly Average reading for submeter 1",
+    x = "Monthly Avg",
+    y = "Month"
+  )
+
+```
+
+```{r}
+ggplot(monthly_sm_power, aes(x = month, y = sm2_avg)) +
+  geom_line() +
+  labs(
+    title = "Time Series plot of monthly Average reading for submeter 2",
+    x = "Monthly Avg",
+    y = "Month"
+  )
+
+```
+
+```{r}
+ggplot(monthly_sm_power, aes(x = month, y = sm3_avg)) +
+  geom_line() +
+  labs(
+    title = "Time Series plot of monthly Average reading for submeter 3",
+    x = "Monthly Avg",
+    y = "Month"
+  )
+
+```
+```{r}
+
+monthly_sm_power %>%
+  model(
+    classical_decomposition(sm1_avg, type = "multiplicative")
+  ) %>%
+  components() %>%
+  autoplot()
+
+```
+```{r}
+
+monthly_sm_power %>%
+  model(
+    classical_decomposition(sm2_avg, type = "multiplicative")
+  ) %>%
+  components() %>%
+  autoplot()
+
+```
+
+```{r}
+
+monthly_sm_power %>%
+  model(
+    classical_decomposition(sm3_avg, type = "multiplicative")
+  ) %>%
+  components() %>%
+  autoplot()
+
+```
+
+All 3 submeter readings have a dip during summer months and a peak during winter months. This is to be expected for submeter 3, as it corresponds to the electric water-heater and air conditioner, but it is interesting to observe that the other 2 submeter readings follow a similar seasonality. 
+
+ETS modelling for global active power:
+
+```{r}
+fit_ets_1 <- monthly_ga_power %>%
+  model(ETS(average_ga_power ~ error("M") + trend("M") + season("M")))
+
+report(fit_ets_1)
+```
+```{r}
+fit_ets_2 <- monthly_ga_power %>%
+  model(ETS(log(average_ga_power) ~ error("M") + trend("M") + season("M")))
+
+report(fit_ets_2)
+
+```
+```{r}
+
+fit_ets_3 <- monthly_ga_power %>%
+  model(ETS(average_ga_power ~ error("A") + trend("A") + season("A")))
+
+report(fit_ets_3)
+
+```
+
+```{r}
+
+gg_tsresiduals(fit_ets_3)
+
+```
+```{r}
+cutoff <- yearmonth(as.Date(max(monthly_ga_power$month)) - months(5))
+
+monthly_ga_power_train <- monthly_ga_power %>%
+  filter(month < cutoff)
+monthly_ga_power_test <- monthly_ga_power %>%
+  filter(month >= cutoff)
+
+tail(monthly_ga_power_train)
+
+fit_ets_test <- monthly_ga_power_train %>%
+  model(ETS(average_ga_power ~ error("A") + trend("A") + season("A")))
+
+fc_ets <- forecast(fit_ets_test, h=6) 
+fc_ets %>% autoplot(monthly_ga_power_test)
+```
+```{r}
+print(accuracy(fc_ets, monthly_ga_power_test))
+```
+
+```{r}
+fit_snaive <- monthly_ga_power_train %>%
+  model(SNAIVE(average_ga_power))
+gg_tsresiduals(fit_snaive)
+```
+```{r}
+report(fit_snaive)
+
+```
+
+```{r}
+
+fc_snaive <- forecast(fit_snaive, h=6) 
+fc_snaive %>% autoplot(monthly_ga_power_test)
+
+```
+```{r}
+
+print(accuracy(fc_snaive, monthly_ga_power_test))
+
+```
+```{r}
+monthly_summary_all <- power_data_filled %>%
+  index_by(month = ~ yearmonth(.)) %>%
+  summarize(
+    average_ga_power = mean(Global_active_power, na.rm = TRUE),
+    average_gr_power = mean(Global_reactive_power, na.rm = TRUE),
+    average_voltage = mean(Voltage, na.rm = TRUE),
+    average_gi = mean(Global_intensity, na.rm = TRUE),
+    average_sm1 = mean(Sub_metering_1, na.rm = TRUE),
+    average_sm2 = mean(Sub_metering_2, na.rm = TRUE),
+    average_sm3 = mean(Sub_metering_3, na.rm = TRUE)
+  )
+
+head(monthly_summary_all)
+
+```
+
+```{r}
+
+corr_matrix <- as.data.frame(monthly_summary_all) %>%
+  select(-month) %>%
+  cor()
+
+print(corr_matrix)
+
+```
+Global active power has a string relationship between global intensity and the 3 submeter readings, hence we will use those in a multiple regression forecasting model
+```{r}
+monthly_summary_train <- monthly_summary_all %>%
+  filter(month < cutoff)
+monthly_summary_test <- monthly_summary_all %>%
+  filter(month >= cutoff)
+head(monthly_summary_train)
+```
+
+```{r}
+
+fit_lm <- lm(average_ga_power ~ average_gi + average_sm1 + average_sm2 + average_sm3 + month, data = monthly_summary_train)
+
+summary(fit_lm)
+
+```
+
+```{r}
+fc_lm <- predict(fit_lm, monthly_summary_test)
+
+monthly_summary_test$predicted <- fc_lm
+
+ggplot() +
+  geom_line(data=monthly_summary_test, aes(x=month, y=average_ga_power, color="Test Data Actual")) +
+  geom_line(data=monthly_summary_test, aes(x=month, y=predicted, color="Test Data Predicted")) +
+  labs(title = "Forecast using multiple regression model", 
+       x = "Month", y = "Average Global Active Power") +
+  scale_color_manual(values = c("Train Data" = "blue", 
+                               "Test Data Actual" = "red", 
+                               "Test Data Predicted" = "green")) +
+  theme_minimal()
+```
+```{r}
+ggplot(monthly_ga_power_train, aes(x = month, y = residuals(fit_lm))) +
+  geom_line(color = "blue") +
+  labs(title = "Residuals of the Multiple Regression Model",
+       x = "Month", y = "Residuals") +
+  theme_minimal()
+
+```
+Checks for ARIMA
+
+```{r}
+lambda <- BoxCox.lambda(monthly_ga_power$average_ga_power)
+transformed_data <- BoxCox(monthly_ga_power$average_ga_power, lambda)
+
+monthly_ga_power <- monthly_ga_power %>%
+  mutate(transformed_avg_ga_power = transformed_data)
+
+# Plot the transformed data
+ggplot(monthly_ga_power, aes(x = month, y = transformed_avg_ga_power)) +
+  geom_line(color = "purple") +
+  labs(title = "Box-Cox Transformed Data", x = "Time", y = "Transformed Power") +
+  theme_minimal()
+
+```
+Stationarity Test and Differencing
+
+test the stationarity of the transformed data using the Augmented Dickey-Fuller (ADF) test. If the data is non-stationary (p-value > 0.05), apply differencing to make it stationary.
+
+```{r}
+# Perform ADF test
+adf_test <- adf.test(monthly_ga_power$transformed_avg_ga_power, alternative = "stationary")
+print(adf_test)
+
+# Differencing if necessary
+if (adf_test$p.value > 0.05) {
+  monthly_ga_power <- monthly_ga_power %>%
+    mutate(diff_transformed_avg_ga_power = difference(transformed_avg_ga_power))
+}
+
+# Plot the data after differencing (if applicable)
+ggplot(monthly_ga_power, aes(x = month, y = transformed_avg_ga_power)) +
+  geom_line(color = "blue") +
+  labs(title = "Transformed Data (Stationary)", x = "Time", y = "Transformed Average Power") +
+  theme_minimal()
+
+```
+Examine ACF and PACF
+The Autocorrelation Function (ACF) and Partial Autocorrelation Function (PACF) plots help in identifying the order of AR (p) and MA (q) components of the ARIMA model.
+
+```{r}
+# ACF and PACF plots
+ggAcf(monthly_ga_power$transformed_avg_ga_power) +
+  labs(title = "ACF of Transformed Data")
+
+ggPacf(monthly_ga_power$transformed_avg_ga_power) +
+  labs(title = "PACF of Transformed Data")
+
+```
+Fitting ARIMA model
+```{r}
+
+monthly_ga_power_train <- monthly_ga_power %>%
+  filter(month < cutoff)
+monthly_ga_power_test <- monthly_ga_power %>%
+  filter(month >= cutoff)
+
+fit_arima <- monthly_ga_power_train %>%
+  model(ARIMA(transformed_avg_ga_power))
+
+report(fit_arima)
+
+```
+```{r}
+
+gg_tsresiduals(fit_arima)
+
+```
+
+```{r}
+fc_arima <- fit_arima %>%
+  forecast(h=6)
+
+fc_arima %>% autoplot(monthly_ga_power_test)
+```
+```{r}
+print(accuracy(fc_arima, monthly_ga_power_test))
+```
+
+```{r}
+
+forecast_summary <- data.frame(month = monthly_summary_test$month,
+                               actual = monthly_summary_test$average_ga_power,
+                               snaive = fc_snaive$.mean,
+                               ets = fc_ets$.mean,
+                               arima = fc_arima$.mean,
+                               mlr = fc_lm)
+head(forecast_summary)
+```
+
+```{r}
+
+ggplot(monthly_summary_all, aes(x=month)) + 
+  geom_line(data = monthly_summary_all, aes(y=average_ga_power, color = "Actual")) +
+  geom_line(data = monthly_ga_power, aes(y=transformed_avg_ga_power, color = "Transformed")) +
+  geom_line(data = forecast_summary, aes(y = snaive, color = "SNAIVE")) +
+  geom_line(data = forecast_summary, aes(y = arima, color = "ARIMA")) +
+  geom_line(data = forecast_summary, aes(y = ets, color = "ETS")) +
+  geom_line(data = forecast_summary, aes(y = mlr, color = "MLR")) +
+  labs(title = "Forecast Summary",
+       x = "Month", y = "Average Global Active Power") +
+  scale_color_manual(values = c("Actual" = "black","Transformed" = "navy", "SNAIVE" = "blue",
+                                "ARIMA" = "skyblue","ETS" = "red", "MLR" = "green")) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+```
+
+
+
